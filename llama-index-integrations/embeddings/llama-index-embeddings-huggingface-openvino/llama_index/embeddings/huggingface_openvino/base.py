@@ -4,12 +4,16 @@ from pathlib import Path
 from llama_index.core.base.embeddings.base import (
     DEFAULT_EMBED_BATCH_SIZE,
     BaseEmbedding,
+    Embedding,
 )
+from llama_index.core.embeddings.multi_modal_base import MultiModalEmbedding
 from llama_index.core.bridge.pydantic import Field, PrivateAttr
 from llama_index.core.callbacks import CallbackManager
+from llama_index.core.schema import ImageType
 from llama_index.embeddings.huggingface.utils import format_query, format_text
 from optimum.intel.openvino import OVModelForFeatureExtraction
 from transformers import AutoTokenizer
+import openvino as ov
 
 
 class OpenVINOEmbedding(BaseEmbedding):
@@ -138,7 +142,7 @@ class OpenVINOEmbedding(BaseEmbedding):
 
     @staticmethod
     def create_and_save_openvino_model(
-        model_name_or_path: str,
+        model_id_or_path: str,
         output_path: str,
         export_kwargs: Optional[dict] = None,
     ) -> None:
@@ -154,9 +158,9 @@ class OpenVINOEmbedding(BaseEmbedding):
 
         export_kwargs = export_kwargs or {}
         model = OVModelForFeatureExtraction.from_pretrained(
-            model_name_or_path, export=True, compile=False, **export_kwargs
+            model_id_or_path, export=True, compile=False, **export_kwargs
         )
-        tokenizer = AutoTokenizer.from_pretrained(model_name_or_path)
+        tokenizer = AutoTokenizer.from_pretrained(model_id_or_path)
 
         model.save_pretrained(output_path)
         tokenizer.save_pretrained(output_path)
@@ -232,3 +236,136 @@ class OpenVINOEmbedding(BaseEmbedding):
             format_text(text, self.model_name, self.text_instruction) for text in texts
         ]
         return self._embed(texts)
+
+
+class OpenVINOMultiModalEmbedding(MultiModalEmbedding):
+    embed_batch_size: int = Field(default=DEFAULT_EMBED_BATCH_SIZE, gt=0)
+
+    _tokenizer: Any = PrivateAttr()
+    _device: Any = PrivateAttr()
+    _image_encoder: Any = PrivateAttr()
+    _text_encoder: Any = PrivateAttr()
+    _preprocess: Any = PrivateAttr()
+
+    def __init__(
+        self,
+        model_path: str,
+        resize_size: int = 224,
+        tokenizer: Optional[Any] = None,
+        embed_batch_size: int = DEFAULT_EMBED_BATCH_SIZE,
+        device: Optional[str] = "AUTO",
+        **kwargs: Any,
+    ):
+        try:
+            import open_clip
+        except ImportError:
+            raise ImportError("OpenCLIP requires `pip install open_clip_torch` ")
+        from open_clip.transform import image_transform
+
+        core = ov.Core()
+        self._device = device
+
+        image_encoder_path = Path(model_path) / "vision_model.xml"
+        text_encoder_path = Path(model_path) / "text_model.xml"
+        self._tokenizer = tokenizer or open_clip.tokenizer.HFTokenizer(model_path)
+        self._image_encoder = core.compile_model(image_encoder_path, self._device)
+        self._text_encoder = core.compile_model(text_encoder_path, self._device)
+        self._preprocess = image_transform(
+            (resize_size, resize_size), is_train=False, resize_mode="longest"
+        )
+
+        super().__init__(embed_batch_size=embed_batch_size, **kwargs)
+
+    @classmethod
+    def class_name(cls) -> str:
+        return "OpenVINOEmbedding"
+
+    @staticmethod
+    def create_and_save_openvino_model(
+        model_id: str,
+        output_path: str,
+    ) -> None:
+        try:
+            import open_clip
+        except ImportError:
+            raise ImportError("OpenCLIP requires `pip install open_clip_torch` ")
+
+        from optimum.exporters.openvino import export_models
+        from transformers.models.clip import (
+            CLIPTextModelWithProjection,
+            CLIPVisionModelWithProjection,
+        )
+        from optimum.exporters.onnx.model_configs import (
+            CLIPTextOnnxConfig,
+            CLIPVisionModelOnnxConfig,
+        )
+        from typing import Dict
+
+        class CLIPTextModelWithProjectionOVConfig(CLIPTextOnnxConfig):
+            @property
+            def outputs(self) -> Dict[str, Dict[int, str]]:
+                return {
+                    "text_embeds": {0: "batch_size"},
+                }
+
+        class CLIPVisionModelWithProjectionOVConfig(CLIPVisionModelOnnxConfig):
+            @property
+            def outputs(self) -> Dict[str, Dict[int, str]]:
+                return {
+                    "image_embeds": {0: "batch_size"},
+                }
+
+        text_model = CLIPTextModelWithProjection.from_pretrained(model_id)
+        vision_model = CLIPVisionModelWithProjection.from_pretrained(model_id)
+
+        export_models(
+            models_and_export_configs={
+                "text_model": (
+                    text_model,
+                    CLIPTextModelWithProjectionOVConfig(text_model.config),
+                ),
+                "vision_model": (
+                    vision_model,
+                    CLIPVisionModelWithProjectionOVConfig(vision_model.config),
+                ),
+            },
+            output_dir=output_path,
+        )
+        tokenizer = open_clip.tokenizer.HFTokenizer(model_id)
+        try:
+            tokenizer.save_pretrained(output_path)
+        except Exception as exc:
+            print("Only support model with HuggingFace tokenizer.")
+
+        print(
+            f"Saved OpenVINO model to {output_path}. Use it with "
+            f"`embed_model = OpenVINOMultiModalEmbedding(folder_name='{output_path}')`."
+        )
+
+    async def _aget_query_embedding(self, query: str) -> Embedding:
+        return self._get_query_embedding(query)
+
+    def _get_text_embedding(self, text: str) -> Embedding:
+        return self._get_text_embeddings([text])[0]
+
+    def _get_text_embeddings(self, texts: List[str]) -> List[Embedding]:
+        results = []
+        for text in texts:
+            text = self._tokenizer([text])
+            text_embedding = self._text_encoder(text)[0]
+            results.append(text_embedding.tolist()[0])
+        return results
+
+    def _get_query_embedding(self, query: str) -> Embedding:
+        return self._get_text_embedding(query)
+
+    async def _aget_image_embedding(self, img_file_path: ImageType) -> Embedding:
+        return self._get_image_embedding(img_file_path)
+
+    def _get_image_embedding(self, img_file_path: ImageType) -> Embedding:
+        import torch
+        from PIL import Image
+
+        with torch.no_grad():
+            image = self._preprocess(Image.open(img_file_path)).unsqueeze(0)
+            return self._image_encoder(image)[0].tolist()[0]

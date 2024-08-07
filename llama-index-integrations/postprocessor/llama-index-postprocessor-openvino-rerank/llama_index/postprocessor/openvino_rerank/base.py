@@ -110,15 +110,15 @@ class OpenVINORerank(BaseNodePostprocessor):
 
     @staticmethod
     def create_and_save_openvino_model(
-        model_name_or_path: str,
+        model_id_or_path: str,
         output_path: str,
         export_kwargs: Optional[dict] = None,
     ) -> None:
         export_kwargs = export_kwargs or {}
         model = OVModelForSequenceClassification.from_pretrained(
-            model_name_or_path, export=True, compile=False, **export_kwargs
+            model_id_or_path, export=True, compile=False, **export_kwargs
         )
-        tokenizer = AutoTokenizer.from_pretrained(model_name_or_path)
+        tokenizer = AutoTokenizer.from_pretrained(model_id_or_path)
 
         model.save_pretrained(output_path)
         tokenizer.save_pretrained(output_path)
