@@ -1,11 +1,8 @@
+import importlib.util
+
 import pytest
 
-try:
-    import openvino_genai
-
-    has_openvino_genai = True
-except ImportError:
-    has_openvino_genai = False
+has_openvino_genai = importlib.util.find_spec("openvino_genai") is not None
 
 
 @pytest.mark.skipif(
@@ -26,8 +23,6 @@ def test_llm_class():
 )
 def test_streamer_uses_write_method():
     """Verify that the streamer classes define a 'write' method (not deprecated 'put')."""
-    import queue
-    from typing import Union
     from unittest.mock import MagicMock
 
     tokenizer_mock = MagicMock()
